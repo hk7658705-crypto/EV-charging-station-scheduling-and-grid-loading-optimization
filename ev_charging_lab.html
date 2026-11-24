@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EV Charging Station Scheduling and Grid Loading - Virtual Lab</title>
+
+  <!-- A-Frame (WebVR framework). Needs internet the first time the page loads. -->
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+
+  <script>
+    /* =====================================================================
+       EV CHARGING STATION SCHEDULING AND GRID LOADING OPTIMIZATION
+       3D Virtual Lab (simulation) - Mini Project
+
+       Idea: 16 electric vehicles (EVs) arrive in the evening at a charging
+       station that shares one transformer with the neighbourhood load.
+       Mode 1 (UNCONTROLLED): every EV starts charging as soon as it plugs in.
+       Mode 2 (SCHEDULED)   : charging is shifted to the slots with the lowest
+                              total load ("valley filling"), keeping the
+                              transformer under its limit.
+       All numbers (loads, EVs, tariff) are ILLUSTRATIVE SIMULATED DATA,
+       not real measured data.
+       ===================================================================== */
+
+    // ---------- Fixed settings ----------
+    const N_SLOTS = 96;       // the day is split into 96 slots of 15 minutes
+    const DT = 0.25;          // length of one slot in hours
+    const START_H = 12;       // simulation starts at 12:00 noon and runs 24 h
+    const RATE = 7.4;         // charger power of each EV in kW (AC charger)
+    const SLOT_E = RATE * DT; // energy one EV can take in one slot (kWh)
+
+    // ---------- Fleet of 16 EVs (clock hours; departure is next morning) ----------
+    const ARR_H = [17.0, 17.5, 18.0, 18.25, 18.5, 18.75, 19.0, 19.25, 19.5, 20.0, 20.25, 20.5, 21.0, 21.5, 22.0, 17.75];
+    const DEP_H = [7.0, 6.5, 7.5, 8.0, 7.0, 6.0, 8.5, 7.5, 7.0, 8.0, 6.5, 7.0, 8.0, 7.5, 6.0, 9.0];
+    const NEED = [22, 15, 28, 18, 25, 12, 30, 20, 16, 26, 14, 24, 18, 22, 10, 28]; // kWh needed
+    const toSlot = (h) => Math.round(((h < START_H ? h + 24 : h) - START_H) / DT);
+    const EVS = ARR_H.map((a, i) => ({ arr: toSlot(a), dep: toSlot(DEP_H[i]), need: NEED[i] }));
+
+    // ---------- Neighbourhood (base) load in kW at a given slot ----------
+    function hourOfSlot(s) { return (START_H + s * DT) % 24; }
+    function baseLoad(s) {
+      const h = hourOfSlot(s);
+      const g = (c, w) => Math.exp(-Math.pow((h - c) / w, 2));
+      const hh = h < 12 ? h + 24 : h; // so the evening peak is a smooth bump
+      return 35 + 18 * g(8, 2) + 40 * Math.exp(-Math.pow((hh - 19.5) / 2.2, 2));
+    }
+    // ---------- Illustrative time-of-use tariff in Rs per kWh ----------
+    function price(s) {
+      const h = hourOfSlot(s);
+      if (h >= 18 && h < 22) return 10;   // peak hours
+      if (h >= 22 || h < 6) return 5;     // off-peak (night)
+      return 7;                           // normal
+    }
+
+    const BASE = Array.from({ length: N_SLOTS }, (_, s) => baseLoad(s));
+
+    // ---------- MODE 1: uncontrolled charging (start at arrival) ----------
+    function scheduleUncontrolled() {
+      return EVS.map(ev => {
+        const row = new Array(N_SLOTS).fill(0);
+        let rem = ev.need;
+        for (let s = ev.arr; s < ev.dep && rem > 1e-9; s++) {
+          const e = Math.min(SLOT_E, rem);
+          row[s] = e / DT; rem -= e;
+        }
+        return row;
+      });
+    }
+
+    // ---------- MODE 2: scheduled charging (valley filling) ----------
+    // EVs with a short parking window are handled first. For each EV we keep
+    // choosing the slot with the lowest present total load until its energy is
+    // delivered. First we respect the transformer limit; if that is not
+    // possible the remaining energy is placed in the least loaded slots.
+    function scheduleOptimized(limit) {
+      const load = BASE.slice();
+      const sched = EVS.map(() => new Array(N_SLOTS).fill(0));
+      const order = EVS.map((e, i) => i).sort((a, b) => (EVS[a].dep - EVS[a].arr) - (EVS[b].dep - EVS[b].arr));
+      for (const i of order) {
+        const ev = EVS[i];
+        let rem = ev.need;
+        for (const respectLimit of [true, false]) {
+          while (rem > 1e-9) {
+            let best = -1, bestScore = 1e9;
+            for (let s = ev.arr; s < ev.dep; s++) {
+              if (sched[i][s] > 0) continue;                       // slot already used by this EV
+              const add = Math.min(SLOT_E, rem) / DT;
+              if (respectLimit && load[s] + add > limit) continue; // would overload transformer
+              const score = load[s] + 0.01 * price(s);             // lowest load, then cheapest
+              if (score < bestScore) { bestScore = score; best = s; }
+            }
+            if (best < 0) break;
+            const e = Math.min(SLOT_E, rem);
+            sched[i][best] = e / DT; load[best] += e / DT; rem -= e;
+          }
+        }
+      }
+      return sched;
+    }
+
+    // ---------- Results for one schedule ----------
+    function analyse(sched, limit) {
+      const total = BASE.slice();
+      let cost = 0, evEnergy = 0;
+      sched.forEach(row => row.forEach((p, s) => { total[s] += p; cost += p * DT * price(s); evEnergy += p * DT; }));
+      let peak = 0, peakSlot = 0, sum = 0, over = 0;
+      total.forEach((v, s) => { if (v > peak) { peak = v; peakSlot = s; } sum += v; if (v > limit) over++; });
+      // cumulative energy delivered to each EV up to each slot
+      const cum = sched.map(row => { let c = 0; return row.map(p => (c += p * DT)); });
+      let unmet = 0;
+      EVS.forEach((ev, i) => { unmet += Math.max(0, ev.need - cum[i][N_SLOTS - 1]); });
+      return { sched, total, cum, peak, peakSlot, avg: sum / N_SLOTS, lf: (sum / N_SLOTS) / peak,
+               cost, evEnergy, overHours: over * DT, unmet };
+    }
+
+    const fmtTime = (s) => {
+      const h = Math.floor(hourOfSlot(s));
+      const m = Math.round((hourOfSlot(s) - h) * 60);
+      return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+    };
+
+    AFRAME.registerComponent('ev-lab', {
+      init: function () {
+        // ----- lab state (like the switches on a real panel) -----
+        this.powerOn = false;      // main breaker
+        this.running = false;      // start / pause
+        this.mode = 'U';           // 'U' = uncontrolled, 'S' = scheduled
+        this.speedIdx = 0;         // 1x, 2x, 4x
+        this.speeds = [1, 2, 4];
+        this.limit = 130;          // transformer limit in kW
+        this.tHours = 0;           // hours since 12:00 noon (0 to 24)
+        this.lastSlot = -1;
+
+        this.cLoad = document.getElementById('canvasLoad');
+        this.cGantt = document.getElementById('canvasGantt');
+        this.panelLoad = document.getElementById('panelLoad');
+        this.panelGantt = document.getElementById('panelGantt');
+
+        this.recompute();
+
+        // ----- connect buttons (mouse, touch, VR controller) -----
+        const self = this;
+        const bind = (id, fn) => {
+          const el = document.getElementById(id);
+          el.addEventListener('click', fn);
+          el.addEventListener('mouseenter', () => el.setAttribute('scale', '1.1 1.1 1.1'));
+          el.addEventListener('mouseleave', () => el.setAttribute('scale', '1 1 1'));
+        };
+        bind('bPower', () => self.togglePower());
+        bind('bStart', () => self.toggleRun());
+        bind('bMode', () => self.toggleMode());
+        bind('bSpeed', () => self.cycleSpeed());
+        bind('bLimDn', () => self.changeLimit(-10));
+        bind('bLimUp', () => self.changeLimit(+10));
+        bind('bReset', () => self.reset());
+
+        // ----- laptop keyboard shortcuts -----
+        window.addEventListener('keydown', (e) => {
+          const k = e.key;
+          if (k === 'p' || k === 'P') self.togglePower();
+          else if (k === ' ') { e.preventDefault(); self.toggleRun(); }
+          else if (k === 'm' || k === 'M') self.toggleMode();
+          else if (k === 'f' || k === 'F') self.cycleSpeed();
+          else if (k === 'ArrowUp') self.changeLimit(+10);
+          else if (k === 'ArrowDown') self.changeLimit(-10);
+          else if (k === 'r' || k === 'R') self.reset();
+        });
+
+        this.el.addEventListener('loaded', () => this.refresh(true));
+        setTimeout(() => this.refresh(true), 800);
+      },
+
+      // Calculate both schedules and their results (also after limit change)
+      recompute: function () {
+        this.resU = analyse(scheduleUncontrolled(), this.limit);
+        this.resS = analyse(scheduleOptimized(this.limit), this.limit);
+      },
+      cur: function () { return this.mode === 'U' ? this.resU : this.resS; },
+      other: function () { return this.mode === 'U' ? this.resS : this.resU; },
+
+      // ----- control actions -----
+      togglePower: function () {
+        this.powerOn = !this.powerOn;
+        if (!this.powerOn) this.running = false;   // breaker OFF stops everything
+        this.refresh(true);
+      },
+      toggleRun: function () {
+        if (!this.powerOn) { this.msg = 'Turn the main breaker ON first'; this.refresh(true); return; }
+        if (this.tHours >= 24) this.tHours = 0;
+        this.running = !this.running;
+        this.refresh(true);
+      },
+      toggleMode: function () { this.mode = this.mode === 'U' ? 'S' : 'U'; this.refresh(true); },
+      cycleSpeed: function () { this.speedIdx = (this.speedIdx + 1) % this.speeds.length; this.refresh(true); },
+      changeLimit: function (d) {
+        this.limit = Math.min(180, Math.max(90, this.limit + d));
+        this.recompute(); this.refresh(true);
+      },
+      reset: function () { this.tHours = 0; this.running = false; this.msg = ''; this.refresh(true); },
+
+      // ----- the clock: runs while the lab is ON and STARTED -----
+      tick: function (time, delta) {
+        if (!this.powerOn || !this.running) return;
+        this.tHours += (delta / 1000) * 0.4 * this.speeds[this.speedIdx]; // 24 h in 60 s at 1x
+        if (this.tHours >= 24) { this.tHours = 24; this.running = false; this.refresh(true); return; }
+        this.refresh(false);
+      },
+
+      slotNow: function () { return Math.min(N_SLOTS - 1, Math.floor(this.tHours / DT)); },
+
+      // ----- update everything visible -----
+      refresh: function (force) {
+        const s = this.slotNow();
+        if (!force && s === this.lastSlot) return;
+        this.lastSlot = s;
+
+        const R = this.cur(), O = this.other();
+        const load = R.total[s];
+        const on = this.powerOn;
+        const over = on && load > this.limit;
+
+        // --- cars and charger lights ---
+        let plugged = 0, charging = 0;
+        EVS.forEach((ev, i) => {
+          const car = document.getElementById('car' + i);
+          const lamp = document.getElementById('lamp' + i);
+          const present = s >= ev.arr && s < ev.dep;
+          car.setAttribute('visible', present);
+          let color = '#46505c';                                      // plugged, grid OFF
+          if (present) {
+            plugged++;
+            const full = R.cum[i][s] >= ev.need - 1e-6;
+            const isCh = on && R.sched[i][s] > 0;
+            if (isCh) { color = '#34d27b'; charging++; }
+            else if (full) color = '#3b82f6';
+            else if (on) color = '#f0b429';
+            car.setAttribute('material', 'color', present ? (isCh ? '#2fbf71' : (full ? '#3b82f6' : '#8b95a1')) : '#8b95a1');
+          }
+          lamp.setAttribute('material', 'color', present ? color : '#2b333d');
+        });
+
+        // --- transformer and load bar ---
+        const ratio = on ? load / this.limit : 0;
+        const barH = Math.max(0.01, 0.8 * Math.min(ratio, 1.5) / 1.5);
+        const bar = document.getElementById('loadBar');
+        bar.setAttribute('height', barH);
+        bar.setAttribute('position', '-1.55 ' + (0.78 + barH / 2) + ' -1.95');
+        const col = !on ? '#46505c' : (over ? '#ff4d4d' : (ratio > 0.85 ? '#f0b429' : '#34d27b'));
+        bar.setAttribute('material', 'color', col);
+        document.getElementById('xfmrLamp').setAttribute('material', 'color', col);
+
+        // --- button colours and labels ---
+        document.getElementById('bPower').setAttribute('material', 'color', on ? '#1f9d55' : '#b83232');
+        document.getElementById('lblPower').setAttribute('value', on ? 'POWER ON' : 'POWER OFF');
+        document.getElementById('bStart').setAttribute('material', 'color', this.running ? '#d98a1a' : '#2f6fb5');
+        document.getElementById('lblStart').setAttribute('value', this.running ? 'PAUSE' : 'START');
+        document.getElementById('lblMode').setAttribute('value', this.mode === 'U' ? 'MODE: NORMAL' : 'MODE: SCHEDULED');
+        document.getElementById('bMode').setAttribute('material', 'color', this.mode === 'U' ? '#7a5a2a' : '#1f7a6d');
+        document.getElementById('lblSpeed').setAttribute('value', 'SPEED ' + this.speeds[this.speedIdx] + 'x');
+
+        // --- main information board ---
+        let status;
+        if (!on) status = this.msg || 'Main breaker is OFF. Press POWER.';
+        else if (this.tHours >= 24) status = 'Day complete. Press START to run again, or change MODE.';
+        else if (over) status = 'WARNING: transformer OVERLOADED';
+        else if (!this.running) status = 'Paused. Press START.';
+        else status = 'Running';
+        const pad = (a, n) => String(a).padEnd(n);
+        const modeName = this.mode === 'U' ? 'Normal (plug-in and charge)' : 'Scheduled (valley filling)';
+        let t = '';
+        t += 'Time        ' + fmtTime(s) + '   (day ' + (this.tHours >= 24 ? '100' : Math.floor(this.tHours / 24 * 100)) + '%)\n';
+        t += 'Mode        ' + modeName + '\n';
+        t += 'Load now    ' + (on ? load.toFixed(0) : '0') + ' kW   (limit ' + this.limit + ' kW)\n';
+        t += 'EVs         ' + plugged + ' plugged, ' + charging + ' charging\n';
+        t += 'Status      ' + status + '\n\n';
+        t += 'FULL DAY RESULT (this mode)\n';
+        t += 'Peak load   ' + R.peak.toFixed(0) + ' kW at ' + fmtTime(R.peakSlot) + '\n';
+        t += 'Load factor ' + R.lf.toFixed(2) + '\n';
+        t += 'Overload    ' + R.overHours.toFixed(2) + ' h above limit\n';
+        t += 'Cost        Rs ' + R.cost.toFixed(0) + '  (EV energy ' + R.evEnergy.toFixed(0) + ' kWh)\n';
+        t += 'Peak other mode: ' + O.peak.toFixed(0) + ' kW, cost Rs ' + O.cost.toFixed(0);
+        const board = document.getElementById('txtBoard');
+        board.setAttribute('value', t);
+        board.setAttribute('color', over ? '#ff9a9a' : '#d6e6f7');
+
+        this.drawLoad(s);
+        this.drawGantt(s);
+        this.touch(this.panelLoad); this.touch(this.panelGantt);
+      },
+
+      touch: function (el) {
+        const m = el.getObject3D('mesh');
+        if (m && m.material && m.material.map) m.material.map.needsUpdate = true;
+      },
+
+      // ---------- Graph 1: load curve for the whole day ----------
+      drawLoad: function (sNow) {
+        const c = this.cLoad, g = c.getContext('2d');
+        const W = c.width, H = c.height, L = 70, Rr = 20, T = 56, B = 60, YMAX = 200;
+        const gx = (s) => L + (s / N_SLOTS) * (W - L - Rr);
+        const gy = (v) => H - B - (v / YMAX) * (H - T - B);
+        g.fillStyle = '#0f1d2e'; g.fillRect(0, 0, W, H);
+        g.fillStyle = '#e8f1fb'; g.font = 'bold 26px sans-serif';
+        g.fillText('Grid load over 24 hours (kW)', 20, 34);
+
+        g.font = '17px sans-serif'; g.lineWidth = 1;
+        for (let s = 0; s <= N_SLOTS; s += 16) {
+          g.strokeStyle = '#27405c'; g.beginPath(); g.moveTo(gx(s), T); g.lineTo(gx(s), H - B); g.stroke();
+          g.fillStyle = '#9fb3c8'; g.fillText(String(Math.round(hourOfSlot(s % N_SLOTS === 0 && s > 0 ? 0 : s)) % 24).padStart(2, '0') + ':00', gx(s) - 22, H - B + 24);
+        }
+        for (let v = 0; v <= YMAX; v += 50) {
+          g.strokeStyle = '#27405c'; g.beginPath(); g.moveTo(L, gy(v)); g.lineTo(W - Rr, gy(v)); g.stroke();
+          g.fillStyle = '#9fb3c8'; g.fillText(v, L - 40, gy(v) + 6);
+        }
+        g.strokeStyle = '#e8f1fb'; g.lineWidth = 2;
+        g.beginPath(); g.moveTo(L, T); g.lineTo(L, H - B); g.lineTo(W - Rr, H - B); g.stroke();
+
+        const line = (arr, color, w, dash) => {
+          g.strokeStyle = color; g.lineWidth = w; g.setLineDash(dash || []);
+          g.beginPath();
+          arr.forEach((v, s) => { if (s === 0) g.moveTo(gx(s), gy(v)); else g.lineTo(gx(s), gy(v)); });
+          g.stroke(); g.setLineDash([]);
+        };
+        // area of base load
+        g.fillStyle = 'rgba(120,140,165,0.35)'; g.beginPath(); g.moveTo(gx(0), gy(0));
+        BASE.forEach((v, s) => g.lineTo(gx(s), gy(v))); g.lineTo(gx(N_SLOTS - 1), gy(0)); g.fill();
+        line(BASE, '#8ea3ba', 2);
+        line(this.other().total, 'rgba(240,240,240,0.35)', 2, [6, 6]);       // other mode (faint)
+        line(this.cur().total, this.mode === 'U' ? '#ffb347' : '#34d27b', 4);  // present mode
+        // transformer limit
+        g.strokeStyle = '#ff4d4d'; g.lineWidth = 2; g.setLineDash([10, 6]);
+        g.beginPath(); g.moveTo(L, gy(this.limit)); g.lineTo(W - Rr, gy(this.limit)); g.stroke(); g.setLineDash([]);
+        g.fillStyle = '#ff7a7a'; g.font = '17px sans-serif'; g.fillText('limit ' + this.limit + ' kW', W - 150, gy(this.limit) - 6);
+        // legend
+        g.fillStyle = '#8ea3ba'; g.fillText('base load', L + 10, T + 20);
+        g.fillStyle = this.mode === 'U' ? '#ffb347' : '#34d27b'; g.fillText('base + EVs (this mode)', L + 110, T + 20);
+        g.fillStyle = '#cfcfcf'; g.fillText('other mode (dashed)', L + 320, T + 20);
+        // time cursor
+        if (this.powerOn) {
+          g.strokeStyle = '#ffffff'; g.lineWidth = 2;
+          g.beginPath(); g.moveTo(gx(sNow), T); g.lineTo(gx(sNow), H - B); g.stroke();
+        }
+      },
+
+      // ---------- Graph 2: charging schedule of each EV ----------
+      drawGantt: function (sNow) {
+        const c = this.cGantt, g = c.getContext('2d');
+        const W = c.width, H = c.height, L = 70, Rr = 20, T = 56, B = 44;
+        const rowH = (H - T - B) / EVS.length;
+        const gx = (s) => L + (s / N_SLOTS) * (W - L - Rr);
+        g.fillStyle = '#0f1d2e'; g.fillRect(0, 0, W, H);
+        g.fillStyle = '#e8f1fb'; g.font = 'bold 26px sans-serif';
+        g.fillText('Charging schedule of each EV', 20, 34);
+        g.font = '14px sans-serif';
+        const R = this.cur();
+        EVS.forEach((ev, i) => {
+          const y = T + i * rowH;
+          g.fillStyle = '#9fb3c8'; g.fillText('EV ' + (i + 1), 14, y + rowH * 0.72);
+          g.fillStyle = '#1a2d44'; g.fillRect(gx(ev.arr), y + 1, gx(ev.dep) - gx(ev.arr), rowH - 2);  // parking window
+          for (let s = ev.arr; s < ev.dep; s++) {
+            if (R.sched[i][s] > 0) {
+              g.fillStyle = this.mode === 'U' ? '#ffb347' : '#34d27b';
+              g.fillRect(gx(s), y + 1, Math.max(1, gx(s + 1) - gx(s)), rowH - 2);
+            }
+          }
+        });
+        g.font = '17px sans-serif';
+        for (let s = 0; s <= N_SLOTS; s += 16) {
+          g.fillStyle = '#9fb3c8';
+          g.fillText(String(Math.round(hourOfSlot(s % N_SLOTS === 0 && s > 0 ? 0 : s)) % 24).padStart(2, '0') + ':00', gx(s) - 22, H - 14);
+        }
+        g.fillStyle = '#6f879f'; g.font = '15px sans-serif';
+        g.fillText('dark bar = parked, coloured = charging', W - 330, 34);
+        if (this.powerOn) {
+          g.strokeStyle = '#ffffff'; g.lineWidth = 2;
+          g.beginPath(); g.moveTo(gx(sNow), T); g.lineTo(gx(sNow), H - B); g.stroke();
+        }
+      }
+    });
+  </script>
+</head>
+
+<body>
+  <a-scene ev-lab background="color: #0b1624" renderer="antialias: true" vr-mode-ui="enabled: true">
+
+    <a-assets>
+      <!-- Canvases drawn by JavaScript and shown as graph panels -->
+      <canvas id="canvasLoad" width="900" height="520"></canvas>
+      <canvas id="canvasGantt" width="900" height="520"></canvas>
+    </a-assets>
+
+    <!-- LIGHTS -->
+    <a-entity light="type: ambient; color: #9db3cc; intensity: 0.75"></a-entity>
+    <a-entity light="type: directional; color: #ffffff; intensity: 0.8" position="1 4 3"></a-entity>
+
+    <!-- ROOM -->
+    <a-plane position="0 0 -2" rotation="-90 0 0" width="10" height="10" color="#1b2a3b"></a-plane>
+    <a-plane position="0 3 -5" width="10" height="6" color="#13202f"></a-plane>
+
+    <!-- PLAYER: mouse + WASD on laptop, controllers in VR -->
+    <a-entity id="rig" position="0 0 0.4">
+      <a-entity camera look-controls wasd-controls="acceleration: 25" position="0 1.55 0"
+                cursor="rayOrigin: mouse" raycaster="objects: .clickable"></a-entity>
+      <a-entity laser-controls="hand: left" raycaster="objects: .clickable; far: 6"></a-entity>
+      <a-entity laser-controls="hand: right" raycaster="objects: .clickable; far: 6"></a-entity>
+    </a-entity>
+
+    <!-- TABLE (the miniature charging station sits on it) -->
+    <a-box position="0 0.72 -2.2" width="5.2" height="0.06" depth="1.7" color="#3a4a5e"></a-box>
+    <a-box position="-2.4 0.35 -1.5" width="0.08" height="0.7" depth="0.08" color="#2a3647"></a-box>
+    <a-box position="2.4 0.35 -1.5" width="0.08" height="0.7" depth="0.08" color="#2a3647"></a-box>
+    <a-box position="-2.4 0.35 -2.9" width="0.08" height="0.7" depth="0.08" color="#2a3647"></a-box>
+    <a-box position="2.4 0.35 -2.9" width="0.08" height="0.7" depth="0.08" color="#2a3647"></a-box>
+
+    <!-- GRID TRANSFORMER + LOAD BAR (left) -->
+    <a-box position="-2.05 0.93 -2.3" width="0.5" height="0.3" depth="0.4" color="#6b7684"></a-box>
+    <a-cylinder position="-2.17 1.13 -2.3" radius="0.025" height="0.12" color="#cfd6de"></a-cylinder>
+    <a-cylinder position="-2.05 1.13 -2.3" radius="0.025" height="0.12" color="#cfd6de"></a-cylinder>
+    <a-cylinder position="-1.93 1.13 -2.3" radius="0.025" height="0.12" color="#cfd6de"></a-cylinder>
+    <a-sphere id="xfmrLamp" position="-2.05 0.93 -2.09" radius="0.04" material="color: #46505c; shader: flat"></a-sphere>
+    <a-text value="TRANSFORMER" position="-2.05 1.3 -2.3" align="center" width="1.1" color="#cfe0f2"></a-text>
+    <!-- load bar: height grows with total load; marker line shows the limit -->
+    <a-box position="-1.55 0.775 -1.95" width="0.16" height="0.01" depth="0.01" color="#222"></a-box>
+    <a-box id="loadBar" position="-1.55 0.79 -1.95" width="0.14" height="0.01" depth="0.1" material="color: #46505c; shader: flat"></a-box>
+    <a-box position="-1.55 1.3 -1.95" width="0.22" height="0.01" depth="0.12" material="color: #ff4d4d; shader: flat"></a-box>
+    <a-text value="limit" position="-1.35 1.3 -1.9" width="0.7" color="#ff7a7a"></a-text>
+    <a-text value="load" position="-1.55 0.66 -1.95" align="center" width="0.7" color="#9fb3c8"></a-text>
+
+    <!-- CHARGING LOT: 16 bays in 2 rows. Each bay = pad + charger post + lamp + car. -->
+    <a-entity id="lot" position="0 0 0"></a-entity>
+
+    <!-- CONTROL PANEL (front row of the table): every button works -->
+    <a-box id="bPower" class="clickable" position="-1.08 0.79 -1.58" width="0.32" height="0.05" depth="0.16" material="color: #b83232">
+      <a-text id="lblPower" value="POWER OFF" align="center" position="0 0.03 0" rotation="-90 0 0" width="1.1" color="#ffffff"></a-text></a-box>
+    <a-box id="bStart" class="clickable" position="-0.72 0.79 -1.58" width="0.32" height="0.05" depth="0.16" material="color: #2f6fb5">
+      <a-text id="lblStart" value="START" align="center" position="0 0.03 0" rotation="-90 0 0" width="1.1" color="#ffffff"></a-text></a-box>
+    <a-box id="bMode" class="clickable" position="-0.36 0.79 -1.58" width="0.32" height="0.05" depth="0.16" material="color: #7a5a2a">
+      <a-text id="lblMode" value="MODE: NORMAL" align="center" position="0 0.03 0" rotation="-90 0 0" width="0.8" color="#ffffff"></a-text></a-box>
+    <a-box id="bSpeed" class="clickable" position="0 0.79 -1.58" width="0.32" height="0.05" depth="0.16" color="#4a5a70">
+      <a-text id="lblSpeed" value="SPEED 1x" align="center" position="0 0.03 0" rotation="-90 0 0" width="0.9" color="#ffffff"></a-text></a-box>
+    <a-box id="bLimDn" class="clickable" position="0.36 0.79 -1.58" width="0.32" height="0.05" depth="0.16" color="#8a4a3a">
+      <a-text value="LIMIT -10" align="center" position="0 0.03 0" rotation="-90 0 0" width="0.9" color="#ffffff"></a-text></a-box>
+    <a-box id="bLimUp" class="clickable" position="0.72 0.79 -1.58" width="0.32" height="0.05" depth="0.16" color="#3a7a55">
+      <a-text value="LIMIT +10" align="center" position="0 0.03 0" rotation="-90 0 0" width="0.9" color="#ffffff"></a-text></a-box>
+    <a-box id="bReset" class="clickable" position="1.08 0.79 -1.58" width="0.32" height="0.05" depth="0.16" color="#6b7480">
+      <a-text value="RESET" align="center" position="0 0.03 0" rotation="-90 0 0" width="1.1" color="#ffffff"></a-text></a-box>
+
+    <!-- INFORMATION BOARD -->
+    <a-plane position="0 1.65 -2.6" width="3.7" height="1.0" color="#0a1522"></a-plane>
+    <a-text id="txtBoard" value="" font="monoid" position="-1.8 2.1 -2.59" anchor="left" baseline="top"
+            width="3.6" color="#d6e6f7"></a-text>
+
+    <!-- INSTRUCTIONS (on the floor in front of the table) -->
+    <a-text value="1) POWER on   2) START   3) Compare MODE: NORMAL and SCHEDULED   4) Change LIMIT and watch the load bar&#10;Keys: P power, Space start/pause, M mode, F speed, Up/Down limit, R reset, W A S D move"
+            position="0 0.02 -0.9" rotation="-90 0 0" align="center" width="3.4" color="#6f879f"></a-text>
+
+    <!-- GRAPH PANELS on the back wall -->
+    <a-plane id="panelLoad" position="-1.55 2.95 -4.9" width="2.9" height="1.67"
+             material="src: #canvasLoad; shader: flat"></a-plane>
+    <a-plane id="panelGantt" position="1.55 2.95 -4.9" width="2.9" height="1.67"
+             material="src: #canvasGantt; shader: flat"></a-plane>
+
+  </a-scene>
+
+  <script>
+    /* Build the 16 charging bays with JavaScript (simpler than writing 16 copies) */
+    window.addEventListener('DOMContentLoaded', function () {
+      const lot = document.getElementById('lot');
+      for (let i = 0; i < 16; i++) {
+        const row = Math.floor(i / 8), col = i % 8;
+        const x = -1.0 + col * 0.42;
+        const z = row === 0 ? -2.55 : -2.05;
+        const bay = document.createElement('a-entity');
+        bay.setAttribute('position', x + ' 0.75 ' + z);
+        bay.innerHTML =
+          '<a-box position="0 0.005 0" width="0.36" height="0.01" depth="0.42" color="#27323f"></a-box>' +
+          '<a-box position="0.15 0.08 ' + (row === 0 ? 0.17 : -0.17) + '" width="0.04" height="0.16" depth="0.04" color="#aab4c0"></a-box>' +
+          '<a-sphere id="lamp' + i + '" position="0.15 0.18 ' + (row === 0 ? 0.17 : -0.17) + '" radius="0.025" material="color: #2b333d; shader: flat"></a-sphere>' +
+          '<a-box id="car' + i + '" position="-0.02 0.07 0" width="0.2" height="0.1" depth="0.34" visible="false" material="color: #8b95a1"></a-box>';
+        lot.appendChild(bay);
+      }
+    });
+  </script>
+</body>
+</html>
